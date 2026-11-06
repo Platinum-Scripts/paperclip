@@ -130,4 +130,34 @@ describe("database backup owner", () => {
     expect(runDatabaseBackup).not.toHaveBeenCalled();
     expect(idleWorkSnapshot().active).toBe(0);
   });
+
+  it("skips a scheduled backup when another process holds the backup lock and conflicts on manual", async () => {
+    const db = await import("@paperclipai/db");
+    const error = new db.DatabaseBackupInProgressError();
+    logger.warn.mockClear();
+    logger.error.mockClear();
+    vi.mocked(runDatabaseBackup).mockRejectedValueOnce(error);
+    await expect(owner()("scheduled")).resolves.toBeNull();
+    expect(logger.error).not.toHaveBeenCalled();
+    expect(logger.warn.mock.calls.flat().join(" ")).toMatch(/still running|already in progress/i);
+    vi.mocked(runDatabaseBackup).mockRejectedValueOnce(error);
+    await expect(owner()("manual")).rejects.toMatchObject({ status: 409 });
+  });
+
+  it("records a redacted javascript fallback reason without treating it as a backup failure", async () => {
+    logger.warn.mockClear();
+    logger.error.mockClear();
+    vi.mocked(runDatabaseBackup).mockResolvedValueOnce({
+      backupFile: path.join(directory, "fixture.sql.gz"),
+      sizeBytes: 32,
+      prunedCount: 0,
+      backupEngineUsed: "javascript",
+      engineFallbackReason: "pg_dump failed with exit code 1",
+    } as Awaited<ReturnType<typeof runDatabaseBackup>>);
+    const result = await owner()("scheduled");
+    expect(result?.backupEngineUsed).toBe("javascript");
+    expect(logger.error).not.toHaveBeenCalled();
+    expect(logger.warn.mock.calls.flat().join(" ")).toContain("exit code 1");
+    expect(JSON.stringify(logger.warn.mock.calls)).not.toContain("S3cret-Backup-Pass");
+  });
 });

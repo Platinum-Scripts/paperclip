@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { formatDatabaseBackupResult, runDatabaseBackup, type BackupRetentionPolicy } from "@paperclipai/db";
+import { DatabaseBackupInProgressError, formatDatabaseBackupResult, runDatabaseBackup, type BackupRetentionPolicy } from "@paperclipai/db";
 import { conflict } from "../errors.js";
 import type { InstanceDatabaseBackupRunResult, InstanceDatabaseBackupTrigger } from "../routes/instance-database-backups.js";
 import { beginIdleTrackedWork } from "./task-admission.js";
@@ -61,11 +61,17 @@ export function createDatabaseBackupOwner(options: {
         finishedAt: finishedAt.toISOString(),
         durationMs: Date.now() - startedAtMs,
       };
+      if (result.engineFallbackReason) {
+        options.logger.warn(
+          `Database backup used the JavaScript engine because pg_dump failed: ${result.engineFallbackReason}`,
+        );
+      }
       options.logger.info(
         {
           backupFile: result.backupFile,
           sizeBytes: result.sizeBytes,
           prunedCount: result.prunedCount,
+          backupEngineUsed: result.backupEngineUsed,
           backupDir: options.backupDir,
           retention,
           trigger,
@@ -75,6 +81,16 @@ export function createDatabaseBackupOwner(options: {
       );
       return response;
     } catch (err) {
+      if (
+        err instanceof DatabaseBackupInProgressError
+        || (err instanceof Error && err.name === "DatabaseBackupInProgressError")
+      ) {
+        if (trigger === "scheduled") {
+          options.logger.warn("Skipping scheduled database backup because a previous backup is still running");
+          return null;
+        }
+        throw conflict("Database backup already in progress");
+      }
       options.logger.error({ err, backupDir: options.backupDir, trigger }, `${label} database backup failed`);
       throw err;
     } finally {

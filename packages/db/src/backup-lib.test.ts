@@ -663,4 +663,48 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
     },
     20_000,
   );
+
+  it(
+    "restores a legacy gzipped sql archive without a live database dump",
+    async () => {
+      const restoreConnectionString = await createTempDatabase();
+      const restoreSql = postgres(restoreConnectionString, { max: 1, onnotice: () => {} });
+      const backupDir = createTempDir("paperclip-db-restore-gzip-");
+      const backupFile = path.join(backupDir, "manual.sql.gz");
+      const sql = [
+        "-- Paperclip database backup",
+        "-- Created: 2026-04-06T00:00:00.000Z",
+        "",
+        "BEGIN;",
+        "-- paperclip statement breakpoint 69f6f3f1-42fd-46a6-bf17-d1d85f8f3900",
+        "CREATE TABLE public.restore_gzip_test (id integer primary key, payload text not null);",
+        "-- paperclip statement breakpoint 69f6f3f1-42fd-46a6-bf17-d1d85f8f3900",
+        "INSERT INTO public.restore_gzip_test (id, payload)",
+        "VALUES (1, 'gzip-legacy');",
+        "-- paperclip statement breakpoint 69f6f3f1-42fd-46a6-bf17-d1d85f8f3900",
+        "COMMIT;",
+        "-- paperclip statement breakpoint 69f6f3f1-42fd-46a6-bf17-d1d85f8f3900",
+        "",
+      ].join("\n");
+
+      try {
+        await fs.promises.writeFile(backupFile, gzipSync(sql));
+        expect(gunzipSync(fs.readFileSync(backupFile)).toString("utf8")).toBe(sql);
+
+        await runDatabaseRestore({
+          connectionString: restoreConnectionString,
+          backupFile,
+        });
+
+        const rows = await restoreSql.unsafe<{ payload: string }[]>(`
+          SELECT payload
+          FROM public.restore_gzip_test
+        `);
+        expect(rows).toEqual([{ payload: "gzip-legacy" }]);
+      } finally {
+        await restoreSql.end();
+      }
+    },
+    20_000,
+  );
 });

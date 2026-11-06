@@ -583,6 +583,8 @@ export interface HarnessSession {
   usage?(): Promise<Record<string, unknown> | null>;
   transcript?(): Promise<HarnessTranscriptSnapshot>;
   snapshot(): Promise<PersistedHarnessSession>;
+  /** Release settled active use. False preserves a host without this capability. */
+  release?(): Promise<boolean>;
   /** Relinquish controller authority without semantically closing the session. */
   detachControllerForRestart?(): Promise<void>;
   close(input: { reason: string; force?: boolean }): Promise<void>;

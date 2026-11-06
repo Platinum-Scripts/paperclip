@@ -199,6 +199,8 @@ export interface NativeSession {
   identity(): NativeRunIdentity;
   capabilities(): Promise<NativeSessionCapabilities>;
   attachRun?(input: { identity: NativeRunIdentity; currentRunGrant?: NativeRunRuntimeGrant }): Promise<void>;
+  /** Release settled active use. False preserves a host without this capability. */
+  release?(): Promise<boolean>;
   /** Relinquish controller authority without suspending provider execution. */
   detachControllerForRestart?(): Promise<void>;
   events(input?: { afterCursor?: string | null }): AsyncIterable<PrpEvent>;

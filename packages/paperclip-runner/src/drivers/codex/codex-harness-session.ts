@@ -894,6 +894,11 @@ export class CodexHarnessSession
     await this.transport.close(input?.reason);
   }
 
+  async release(): Promise<boolean> {
+    this.assertProtocolIntegrity();
+    return this.transport.release?.() ?? false;
+  }
+
   async detachControllerForRestart(): Promise<void> {
     if (this.transport.detachControllerForRestart === undefined) return;
     await this.transport.detachControllerForRestart();

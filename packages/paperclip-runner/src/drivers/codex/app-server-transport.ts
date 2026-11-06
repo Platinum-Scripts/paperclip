@@ -64,6 +64,8 @@ export interface CodexAppServerTransport {
    * diagnostic context; transports must not forward it to the provider.
    */
   close(reason?: string): Promise<void>;
+  /** Release settled active use. False preserves a host without this capability. */
+  release?(): Promise<boolean>;
   /** Relinquish controller authority while leaving durable runner work alive. */
   detachControllerForRestart?(): Promise<void>;
   processInfo?(): CodexTransportProcessInfo;

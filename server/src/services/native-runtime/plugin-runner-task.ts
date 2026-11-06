@@ -48,6 +48,9 @@ export function createPluginRunnerTaskOwner(input: {
   pollMs?: number;
   warmTaskVersion?: 1;
   releaseResumeVersion?: 1;
+  releasedSource?: DurableRecoveryIdentity;
+  onResumed?: (identity: DurableRecoveryIdentity) => Promise<void>;
+  onRetired?: (identity: DurableRecoveryIdentity) => Promise<void>;
   githubBroker?: { url: string; token: string };
   adoptIdentity?: DurableRecoveryIdentity;
 }) {
@@ -318,6 +321,8 @@ export function createPluginRunnerTaskOwner(input: {
         if (submitted) {
           await call({ kind: "complete" });
           completed = true;
+          const identity = preparedIdentity ?? launchIdentity ?? input.priorIdentity;
+          if (identity) await input.onRetired?.(identity);
         }
       },
       release: async (reason?: "detach") => {
@@ -330,6 +335,25 @@ export function createPluginRunnerTaskOwner(input: {
     };
   };
   const driver: RunnerExecutionDriver = {
+    get releaseResume() {
+      if (input.releaseResumeVersion !== 1 || input.warmTaskVersion !== 1 || !input.accountIdentity) return undefined;
+      return {
+        releasedSource: input.releasedSource,
+        release: async (identity: DurableRecoveryIdentity) => {
+          requireReleaseResume();
+          const outbound = activeOutbound;
+          outbound?.quiesce();
+          await release(identity);
+          await outbound?.close();
+          if (activeOutbound === outbound) activeOutbound = null;
+        },
+        resume: async (identity: DurableRecoveryIdentity, ticket: string) => {
+          const outcome = await resume(identity, ticket);
+          if (outcome === "resumed") await input.onResumed?.(identity);
+          return outcome;
+        },
+      };
+    },
     get authorityRunId() { return input.authorityRunId ?? input.executionContext?.execution.binding.runId; },
     get codexSourceRecoveryVersion() { return input.codexSourceRecoveryVersion; },
     prepareLaunch, authorizeRunnerAdoption, readRunnerState, runnerProcessLauncher: launcher,

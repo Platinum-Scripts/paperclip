@@ -1,7 +1,7 @@
 import path from "node:path";
 import * as p from "@clack/prompts";
 import pc from "picocolors";
-import { formatDatabaseBackupResult, runDatabaseBackup } from "@paperclipai/db";
+import { formatDatabaseBackupResult, resolveDatabaseBackupPrune, runDatabaseBackup } from "@paperclipai/db";
 import {
   expandHomePrefix,
   resolveDefaultBackupDir,
@@ -75,6 +75,7 @@ export async function dbBackupCommand(opts: DbBackupOptions): Promise<void> {
       backupDir,
       retention: { dailyDays: retentionDays, weeklyWeeks: 4, monthlyMonths: 1 },
       filenamePrefix,
+      prune: resolveDatabaseBackupPrune(),
     });
     spinner.stop(`Backup saved: ${formatDatabaseBackupResult(result)}`);
 

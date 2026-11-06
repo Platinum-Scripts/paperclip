@@ -38,6 +38,8 @@ import {
   prepareEmbeddedPostgresNativeRuntime,
   reconcilePendingMigrationHistory,
   formatDatabaseBackupResult,
+  resolveDatabaseBackupPrune,
+  DatabaseBackupInProgressError,
   runDatabaseBackup,
   authUsers,
   companies,
@@ -844,6 +846,8 @@ async function startServerWithDatabaseTeardown(
         backupDir: config.databaseBackupDir,
         retention,
         filenamePrefix: "paperclip",
+        // Unset PAPERCLIP_DB_BACKUP_PRUNE keeps retention deletion. Set it to 0 to skip pruneOldBackups.
+        prune: resolveDatabaseBackupPrune(),
       });
       const finishedAt = new Date();
       const response: InstanceDatabaseBackupRunResult = {
@@ -855,11 +859,17 @@ async function startServerWithDatabaseTeardown(
         finishedAt: finishedAt.toISOString(),
         durationMs: Date.now() - startedAtMs,
       };
+      if (result.engineFallbackReason) {
+        logger.warn(
+          `Database backup used the JavaScript engine because pg_dump failed: ${result.engineFallbackReason}`,
+        );
+      }
       logger.info(
         {
           backupFile: result.backupFile,
           sizeBytes: result.sizeBytes,
           prunedCount: result.prunedCount,
+          backupEngineUsed: result.backupEngineUsed,
           backupDir: config.databaseBackupDir,
           retention,
           trigger,
@@ -869,6 +879,16 @@ async function startServerWithDatabaseTeardown(
       );
       return response;
     } catch (err) {
+      if (
+        err instanceof DatabaseBackupInProgressError
+        || (err instanceof Error && err.name === "DatabaseBackupInProgressError")
+      ) {
+        if (trigger === "scheduled") {
+          logger.warn("Skipping scheduled database backup because a previous backup is still running");
+          return null;
+        }
+        throw conflict("Database backup already in progress");
+      }
       logger.error({ err, backupDir: config.databaseBackupDir, trigger }, `${label} database backup failed`);
       throw err;
     } finally {

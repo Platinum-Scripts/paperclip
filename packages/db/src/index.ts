@@ -25,6 +25,8 @@ export {
   runDatabaseBackup,
   runDatabaseRestore,
   formatDatabaseBackupResult,
+  resolveDatabaseBackupPrune,
+  DatabaseBackupInProgressError,
   type BackupRetentionPolicy,
   type RunDatabaseBackupOptions,
   type RunDatabaseBackupResult,

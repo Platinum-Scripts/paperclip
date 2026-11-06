@@ -1,11 +1,28 @@
-import { createReadStream, createWriteStream, existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from "node:fs";
-import { basename, resolve } from "node:path";
+import {
+  closeSync,
+  constants,
+  createReadStream,
+  createWriteStream,
+  existsSync,
+  fchmodSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { basename, dirname, resolve } from "node:path";
 import { createInterface } from "node:readline";
-import { spawn } from "node:child_process";
-import { open as openFile } from "node:fs/promises";
+import { spawn, type ChildProcess } from "node:child_process";
+import { link, open as openFile } from "node:fs/promises";
+import { PassThrough, type Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { createGunzip, createGzip } from "node:zlib";
 import postgres from "postgres";
+import { randomUUID } from "node:crypto";
 
 export type BackupRetentionPolicy = {
   dailyDays: number;
@@ -28,13 +45,37 @@ export type RunDatabaseBackupOptions = {
   excludeTables?: string[];
   nullifyColumns?: Record<string, string[]>;
   backupEngine?: "auto" | "pg_dump" | "javascript";
+  /**
+   * Retention deletion runs only when this is not false.
+   * The default keeps the existing pruneOldBackups call.
+   * Pass false, or set PAPERCLIP_DB_BACKUP_PRUNE=0, for a backup that must not delete existing archives.
+   */
+  prune?: boolean;
 };
 
 export type RunDatabaseBackupResult = {
   backupFile: string;
   sizeBytes: number;
   prunedCount: number;
+  backupEngineUsed: "pg_dump" | "javascript";
+  engineFallbackReason?: string;
 };
+
+export class DatabaseBackupInProgressError extends Error {
+  readonly code = "DATABASE_BACKUP_IN_PROGRESS";
+
+  constructor() {
+    super("Database backup already in progress");
+    this.name = "DatabaseBackupInProgressError";
+  }
+}
+
+/** True unless the operator explicitly disables retention deletion. */
+export function resolveDatabaseBackupPrune(envValue: string | undefined = process.env.PAPERCLIP_DB_BACKUP_PRUNE): boolean {
+  const normalized = envValue?.trim().toLowerCase();
+  if (normalized === "0" || normalized === "false" || normalized === "off" || normalized === "no") return false;
+  return true;
+}
 
 export type RunDatabaseRestoreOptions = {
   connectionString: string;
@@ -114,11 +155,12 @@ function monthlyRetentionCutoff(nowMs: number, monthlyMonths: number): number {
 }
 
 /**
- * Tiered backup pruning:
- * - Daily tier: keep ALL backups from the last `dailyDays` days
- * - Weekly tier: keep the NEWEST backup per calendar week for `weeklyWeeks` weeks
- * - Monthly tier: keep the NEWEST backup per calendar month for `monthlyMonths` months
- * - Everything else is deleted
+ * Tiered backup pruning. This is the only backup-archive deletion in this module.
+ * It unlinks files in `backupDir` whose names start with `${filenamePrefix}-`
+ * and end with `.sql` or `.sql.gz` when they fall outside the daily, weekly,
+ * and monthly tiers. It does not unlink partial files or lock files.
+ * `runDatabaseBackup` calls it after a successful publish only when `prune !== false`.
+ * Callers that omit `prune` still delete old archives.
  */
 function pruneOldBackups(backupDir: string, retention: BackupRetentionPolicy, filenamePrefix: string): number {
   if (!existsSync(backupDir)) return 0;
@@ -292,6 +334,277 @@ function formatSqlValue(
   return formatSqlLiteral(String(val));
 }
 
+const inProcessBackupLocks = new Set<string>();
+
+type BackupLockOwner = {
+  pid: number;
+  startTime: string | null;
+  token: string;
+};
+
+function processStartTime(pid: number): string | null {
+  if (process.platform !== "linux") return null;
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const commandEnd = stat.lastIndexOf(")");
+    if (commandEnd < 0) return null;
+    return stat.slice(commandEnd + 2).trim().split(/\s+/)[19] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function lockOwnerAlive(owner: BackupLockOwner): boolean {
+  if (!Number.isInteger(owner.pid) || owner.pid <= 0) return false;
+  try {
+    process.kill(owner.pid, 0);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
+    return true;
+  }
+  if (process.platform === "linux" && owner.startTime) {
+    const current = processStartTime(owner.pid);
+    if (current && current !== owner.startTime) return false;
+  }
+  return true;
+}
+
+function readLockOwner(lockPath: string): BackupLockOwner | null {
+  try {
+    const parsed = JSON.parse(readFileSync(lockPath, "utf8")) as Partial<BackupLockOwner>;
+    if (!parsed || typeof parsed.pid !== "number" || typeof parsed.token !== "string") return null;
+    return {
+      pid: parsed.pid,
+      startTime: typeof parsed.startTime === "string" ? parsed.startTime : null,
+      token: parsed.token,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function acquireInstanceBackupLock(backupDir: string): Promise<() => void> {
+  const key = resolve(backupDir);
+  if (inProcessBackupLocks.has(key)) throw new DatabaseBackupInProgressError();
+  inProcessBackupLocks.add(key);
+  const lockPath = resolve(key, ".paperclip-backup.lock");
+  const owner: BackupLockOwner = {
+    pid: process.pid,
+    startTime: processStartTime(process.pid),
+    token: randomUUID(),
+  };
+  const flags = constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW;
+  try {
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      try {
+        const fd = openSync(lockPath, flags, 0o600);
+        try {
+          fchmodSync(fd, 0o600);
+          writeFileSync(fd, JSON.stringify(owner));
+          fsyncSync(fd);
+        } finally {
+          closeSync(fd);
+        }
+        let released = false;
+        return () => {
+          if (released) return;
+          released = true;
+          try {
+            if (readLockOwner(lockPath)?.token === owner.token) unlinkSync(lockPath);
+          } catch {
+            // The lock file is coordination state. A failed unlink must not hide the backup result.
+          }
+          inProcessBackupLocks.delete(key);
+        };
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        const current = readLockOwner(lockPath);
+        if (current && lockOwnerAlive(current)) throw new DatabaseBackupInProgressError();
+        try { unlinkSync(lockPath); } catch { /* another process is replacing the stale lock */ }
+      }
+    }
+    throw new DatabaseBackupInProgressError();
+  } catch (error) {
+    inProcessBackupLocks.delete(key);
+    throw error;
+  }
+}
+
+function backupSecrets(connectionString: string): string[] {
+  const secrets = new Set<string>();
+  try {
+    const url = new URL(connectionString);
+    if (url.password) {
+      secrets.add(url.password);
+      try { secrets.add(decodeURIComponent(url.password)); } catch { /* keep the raw password */ }
+    }
+  } catch {
+    // Non-URL connection strings are passed through unchanged.
+  }
+  return [...secrets].filter((secret) => secret.length > 0);
+}
+
+function redactBackupText(text: string, secrets: string[]): string {
+  let redacted = text;
+  for (const secret of secrets) redacted = redacted.split(secret).join("[redacted]");
+  return redacted.replace(/\b([a-z][a-z0-9+.-]*:\/\/[^:\s/@]+):[^@\s/]+@/gi, "$1:[redacted]@");
+}
+
+function redactThrown(error: unknown, secrets: string[]): unknown {
+  if (!(error instanceof Error)) return new Error(redactBackupText(String(error), secrets));
+  const message = redactBackupText(error.message, secrets);
+  if (message === error.message) return error;
+  const redacted = new Error(message);
+  redacted.name = error.name;
+  return redacted;
+}
+
+function libpqTarget(connectionString: string): { dbname: string; password?: string } {
+  try {
+    const url = new URL(connectionString);
+    const password = url.password ? decodeURIComponent(url.password) : "";
+    if (password) url.password = "";
+    return { dbname: url.toString(), ...(password ? { password } : {}) };
+  } catch {
+    return { dbname: connectionString };
+  }
+}
+
+function collisionPath(desiredPath: string, attempt: number): string {
+  if (attempt === 0) return desiredPath;
+  if (desiredPath.endsWith(".sql.gz")) {
+    return `${desiredPath.slice(0, -".sql.gz".length)}-${attempt + 1}.sql.gz`;
+  }
+  return `${desiredPath}.${attempt + 1}`;
+}
+
+async function syncDirectory(directory: string): Promise<void> {
+  const handle = await openFile(directory, "r");
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+async function publishExclusive(tempPath: string, desiredPath: string): Promise<string> {
+  for (let attempt = 0; attempt < 1000; attempt += 1) {
+    const candidate = collisionPath(desiredPath, attempt);
+    try {
+      await link(tempPath, candidate);
+      await syncDirectory(dirname(candidate));
+      return candidate;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") continue;
+      throw error;
+    }
+  }
+  throw new Error("Could not publish the backup without overwriting an existing archive");
+}
+
+function openStreamingGzip(directory: string, desiredPath: string) {
+  const tempPath = resolve(directory, `.${basename(desiredPath)}.partial-${randomUUID()}`);
+  const flags = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW;
+  const fd = openSync(tempPath, flags, 0o600);
+  fchmodSync(fd, 0o600);
+  const output = createWriteStream(tempPath, { fd, autoClose: false });
+  const gzip = createGzip();
+  const input = new PassThrough();
+  let failure: Error | null = null;
+  let closed = false;
+  let rejectFailure: (error: Error) => void = () => {};
+  const failed = new Promise<never>((_, reject) => {
+    rejectFailure = reject;
+  });
+  failed.catch(() => {});
+  const noteFailure = (error: unknown) => {
+    const normalized = error instanceof Error ? error : new Error(String(error));
+    if (!failure) failure = normalized;
+    rejectFailure(failure);
+    return failure;
+  };
+  const done = pipeline(input, gzip, output).catch((error: unknown) => {
+    throw noteFailure(error);
+  });
+  done.catch(() => {});
+  gzip.once("error", noteFailure);
+
+  const write = async (chunk: string | Buffer): Promise<void> => {
+    if (failure) throw failure;
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    if (input.write(buffer)) return;
+    await new Promise<void>((resolvePromise, reject) => {
+      const onError = (error: Error) => {
+        cleanup();
+        failure = error;
+        reject(error);
+      };
+      const onDrain = () => {
+        cleanup();
+        resolvePromise();
+      };
+      const cleanup = () => {
+        input.off("error", onError);
+        input.off("drain", onDrain);
+      };
+      input.once("error", onError);
+      input.once("drain", onDrain);
+      done.then(() => undefined, onError);
+    });
+    if (failure) throw failure;
+  };
+
+  return {
+    tempPath,
+    failed,
+    write,
+    async finish(): Promise<string> {
+      if (failure) throw failure;
+      input.end();
+      await done;
+      if (!closed) {
+        fsyncSync(fd);
+        closeSync(fd);
+        closed = true;
+      }
+      return publishExclusive(tempPath, desiredPath);
+    },
+    abort() {
+      if (!input.destroyed) input.destroy();
+      if (!gzip.destroyed) gzip.destroy();
+      if (!output.destroyed) output.destroy();
+      if (!closed) {
+        closed = true;
+        try { closeSync(fd); } catch { /* the stream may already own the descriptor */ }
+      }
+    },
+  };
+}
+
+function terminateChild(child: ChildProcess): void {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  child.kill("SIGTERM");
+  const timer = setTimeout(() => {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+  }, 1000);
+  timer.unref();
+  child.once("exit", () => clearTimeout(timer));
+}
+
+function publishedBackupCounts(
+  opts: RunDatabaseBackupOptions,
+  filenamePrefix: string,
+  retention: BackupRetentionPolicy,
+  publishedPath: string,
+  partialPath: string,
+): { sizeBytes: number; prunedCount: number } {
+  const sizeBytes = statSync(publishedPath).size;
+  // Drop only the extra directory entry for this new archive. The final name keeps the bytes.
+  try { unlinkSync(partialPath); } catch { /* the published name still holds the archive */ }
+  if (opts.prune === false) return { sizeBytes, prunedCount: 0 };
+  return { sizeBytes, prunedCount: pruneOldBackups(opts.backupDir, retention, filenamePrefix) };
+}
+
 function appendCapturedStderr(previous: string, chunk: Buffer | string): string {
   const next = previous + (Buffer.isBuffer(chunk) ? chunk.toString("utf8") : chunk);
   if (Buffer.byteLength(next, "utf8") <= BACKUP_CLI_STDERR_BYTES) return next;
@@ -319,14 +632,17 @@ async function waitForChildExit(child: ReturnType<typeof spawn>, label: string):
 
 async function runPgDumpBackup(opts: {
   connectionString: string;
+  backupDir: string;
   backupFile: string;
   connectTimeout: number;
-}): Promise<void> {
+}): Promise<{ publishedPath: string; tempPath: string }> {
   const pgDumpBin = process.env.PAPERCLIP_PG_DUMP_PATH || "pg_dump";
+  const target = libpqTarget(opts.connectionString);
+  const secrets = backupSecrets(opts.connectionString);
   const child = spawn(
     pgDumpBin,
     [
-      `--dbname=${opts.connectionString}`,
+      `--dbname=${target.dbname}`,
       "--format=plain",
       "--clean",
       "--if-exists",
@@ -338,18 +654,62 @@ async function runPgDumpBackup(opts: {
       env: {
         ...process.env,
         PGCONNECT_TIMEOUT: String(opts.connectTimeout),
+        ...(target.password ? { PGPASSWORD: target.password } : {}),
       },
     },
   );
+  child.once("error", () => {
+    child.stdout?.destroy();
+  });
 
   if (!child.stdout) {
+    terminateChild(child);
     throw new Error("pg_dump did not expose stdout");
   }
 
-  await Promise.all([
-    pipeline(child.stdout, createGzip(), createWriteStream(opts.backupFile)),
+  const artifact = openStreamingGzip(opts.backupDir, opts.backupFile);
+  artifact.failed.catch(() => {
+    child.stdout?.destroy();
+    terminateChild(child);
+  });
+  const readable = child.stdout as Readable;
+  const pump = (async () => {
+    try {
+      const iterator = readable[Symbol.asyncIterator]();
+      for (;;) {
+        const next = await Promise.race([
+          iterator.next(),
+          artifact.failed,
+        ]);
+        if (next.done) return;
+        await artifact.write(Buffer.isBuffer(next.value) ? next.value : Buffer.from(String(next.value)));
+      }
+    } catch (error) {
+      terminateChild(child);
+      throw error;
+    }
+  })();
+  const [pumped, exited] = await Promise.allSettled([
+    pump,
     waitForChildExit(child, pgDumpBin),
   ]);
+  const dumpFailure = pumped.status === "rejected"
+    ? pumped.reason
+    : exited.status === "rejected"
+      ? exited.reason
+      : null;
+  if (dumpFailure) {
+    terminateChild(child);
+    artifact.abort();
+    throw redactThrown(dumpFailure, secrets);
+  }
+  try {
+    return { publishedPath: await artifact.finish(), tempPath: artifact.tempPath };
+  } catch (error) {
+    terminateChild(child);
+    artifact.abort();
+    throw redactThrown(error, secrets);
+  }
 }
 
 async function restoreWithPsql(opts: RunDatabaseRestoreOptions, connectTimeout: number): Promise<void> {
@@ -524,6 +884,64 @@ export function createBufferedTextFileWriter(filePath: string, maxBufferedBytes 
   };
 }
 
+function createBufferedTextSink(
+  label: string,
+  writeChunk: (chunk: string | Buffer) => Promise<void>,
+  maxBufferedBytes = DEFAULT_BACKUP_WRITE_BUFFER_BYTES,
+) {
+  const flushThreshold = Math.max(1, Math.trunc(maxBufferedBytes));
+  let bufferedLines: string[] = [];
+  let bufferedBytes = 0;
+  let firstChunk = true;
+  let closed = false;
+  let pendingWrite = Promise.resolve();
+
+  const flushBufferedLines = () => {
+    if (bufferedLines.length === 0) return;
+    const linesToWrite = bufferedLines;
+    bufferedLines = [];
+    bufferedBytes = 0;
+    const chunkBody = linesToWrite.join("\n");
+    const chunk = firstChunk ? chunkBody : `\n${chunkBody}`;
+    firstChunk = false;
+    pendingWrite = pendingWrite.then(() => writeChunk(chunk));
+  };
+
+  return {
+    emit(line: string) {
+      if (closed) throw new Error(`Cannot write to closed backup file: ${label}`);
+      bufferedLines.push(line);
+      bufferedBytes += Buffer.byteLength(line, "utf8") + 1;
+      if (bufferedBytes >= flushThreshold) flushBufferedLines();
+    },
+    async drain() {
+      if (closed) throw new Error(`Cannot drain closed backup file: ${label}`);
+      flushBufferedLines();
+      await pendingWrite;
+    },
+    async writeRaw(chunk: string | Buffer) {
+      if (closed) throw new Error(`Cannot write to closed backup file: ${label}`);
+      flushBufferedLines();
+      firstChunk = false;
+      pendingWrite = pendingWrite.then(() => writeChunk(chunk));
+      await pendingWrite;
+    },
+    async close() {
+      if (closed) return;
+      closed = true;
+      flushBufferedLines();
+      await pendingWrite;
+    },
+    async abort() {
+      if (closed) return;
+      closed = true;
+      bufferedLines = [];
+      bufferedBytes = 0;
+      await pendingWrite.catch(() => {});
+    },
+  };
+}
+
 export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise<RunDatabaseBackupResult> {
   const filenamePrefix = opts.filenamePrefix ?? "paperclip";
   const retention = opts.retention;
@@ -533,6 +951,9 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
   const canUsePgDump = !hasBackupTransforms(opts);
   const excludedTableNames = normalizeTableNameSet(opts.excludeTables);
   const nullifiedColumnsByTable = normalizeNullifyColumnMap(opts.nullifyColumns);
+  const secrets = backupSecrets(opts.connectionString);
+  mkdirSync(opts.backupDir, { recursive: true });
+  const releaseLock = await acquireInstanceBackupLock(opts.backupDir);
   let sql = postgres(opts.connectionString, { max: 1, connect_timeout: connectTimeout });
   let sqlClosed = false;
   const closeSql = async () => {
@@ -540,45 +961,54 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     sqlClosed = true;
     await sql.end();
   };
-  mkdirSync(opts.backupDir, { recursive: true });
-  const sqlFile = resolve(opts.backupDir, `${filenamePrefix}-${timestamp()}.sql`);
-  const backupFile = `${sqlFile}.gz`;
-  const writer = createBufferedTextFileWriter(sqlFile);
+  const backupFile = resolve(opts.backupDir, `${filenamePrefix}-${timestamp()}.sql.gz`);
+  let writer: ReturnType<typeof createBufferedTextSink> | null = null;
+  let artifact: ReturnType<typeof openStreamingGzip> | null = null;
+  let engineFallbackReason: string | undefined;
 
   try {
     if (backupEngine === "pg_dump" || (backupEngine === "auto" && canUsePgDump)) {
       await sql`SELECT 1`;
+      let dumped: { publishedPath: string; tempPath: string } | null = null;
       try {
         await closeSql();
-        await runPgDumpBackup({
+        dumped = await runPgDumpBackup({
           connectionString: opts.connectionString,
+          backupDir: opts.backupDir,
           backupFile,
           connectTimeout,
         });
-        await writer.abort();
-        const sizeBytes = statSync(backupFile).size;
-        const prunedCount = pruneOldBackups(opts.backupDir, retention, filenamePrefix);
-        return {
-          backupFile,
-          sizeBytes,
-          prunedCount,
-        };
       } catch (error) {
-        if (existsSync(backupFile)) {
-          try { unlinkSync(backupFile); } catch { /* ignore */ }
-        }
-        if (backupEngine === "pg_dump") {
-          throw error;
-        }
+        if (backupEngine === "pg_dump") throw error;
+        engineFallbackReason = redactBackupText(error instanceof Error ? error.message : String(error), secrets);
         effectiveBackupEngine = "javascript";
         sql = postgres(opts.connectionString, { max: 1, connect_timeout: connectTimeout });
         sqlClosed = false;
       }
+      if (dumped) {
+        const { sizeBytes, prunedCount } = publishedBackupCounts(
+          opts,
+          filenamePrefix,
+          retention,
+          dumped.publishedPath,
+          dumped.tempPath,
+        );
+        return {
+          backupFile: dumped.publishedPath,
+          sizeBytes,
+          prunedCount,
+          backupEngineUsed: "pg_dump",
+        };
+      }
     }
 
+    const javascriptArchive = openStreamingGzip(opts.backupDir, backupFile);
+    artifact = javascriptArchive;
+    const javascriptWriter = createBufferedTextSink(backupFile, (chunk) => javascriptArchive.write(chunk));
+    writer = javascriptWriter;
     await sql`SELECT 1`;
 
-    const emit = (line: string) => writer.emit(line);
+    const emit = (line: string) => javascriptWriter.emit(line);
     const emitStatement = (statement: string) => {
       emit(statement);
       emit(STATEMENT_BREAKPOINT);
@@ -1018,33 +1448,30 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     emitStatement("COMMIT;");
     emit("");
 
-    await writer.close();
-
-    // Compress the SQL file with gzip
-    const sqlReadStream = createReadStream(sqlFile);
-    const gzWriteStream = createWriteStream(backupFile);
-    await pipeline(sqlReadStream, createGzip(), gzWriteStream);
-    unlinkSync(sqlFile);
-
-    const sizeBytes = statSync(backupFile).size;
-    const prunedCount = pruneOldBackups(opts.backupDir, retention, filenamePrefix);
+    await javascriptWriter.close();
+    const publishedPath = await javascriptArchive.finish();
+    const { sizeBytes, prunedCount } = publishedBackupCounts(
+      opts,
+      filenamePrefix,
+      retention,
+      publishedPath,
+      javascriptArchive.tempPath,
+    );
 
     return {
-      backupFile,
+      backupFile: publishedPath,
       sizeBytes,
       prunedCount,
+      backupEngineUsed: "javascript",
+      ...(engineFallbackReason ? { engineFallbackReason } : {}),
     };
   } catch (error) {
-    await writer.abort();
-    if (existsSync(backupFile)) {
-      try { unlinkSync(backupFile); } catch { /* ignore */ }
-    }
-    if (existsSync(sqlFile)) {
-      try { unlinkSync(sqlFile); } catch { /* ignore */ }
-    }
-    throw error;
+    await writer?.abort();
+    artifact?.abort();
+    throw redactThrown(error, secrets);
   } finally {
     await closeSql();
+    releaseLock();
   }
 }
 
@@ -1089,5 +1516,6 @@ export async function runDatabaseRestore(opts: RunDatabaseRestoreOptions): Promi
 export function formatDatabaseBackupResult(result: RunDatabaseBackupResult): string {
   const size = formatBackupSize(result.sizeBytes);
   const pruned = result.prunedCount > 0 ? `; pruned ${result.prunedCount} old backup(s)` : "";
-  return `${result.backupFile} (${size}${pruned})`;
+  const fallback = result.engineFallbackReason ? `; javascript fallback after ${result.engineFallbackReason}` : "";
+  return `${result.backupFile} (${size}${pruned}${fallback})`;
 }

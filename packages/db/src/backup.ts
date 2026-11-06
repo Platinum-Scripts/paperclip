@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
-import { formatDatabaseBackupResult, runDatabaseBackup } from "./backup-lib.js";
+import { formatDatabaseBackupResult, resolveDatabaseBackupPrune, runDatabaseBackup } from "./backup-lib.js";
 import {
   expandHomePrefix,
   resolveDefaultBackupDir,
@@ -81,6 +81,7 @@ async function main() {
       backupDir,
       retention: { dailyDays: retentionDays, weeklyWeeks: 4, monthlyMonths: 1 },
       filenamePrefix: "paperclip",
+      prune: resolveDatabaseBackupPrune(),
     });
 
     console.log(`Backup saved: ${formatDatabaseBackupResult(result)}`);

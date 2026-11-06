@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { gunzipSync } from "node:zlib";
+import { gunzipSync, gzipSync } from "node:zlib";
 import { afterEach, describe, expect, it } from "vitest";
 import postgres from "postgres";
 import { createBufferedTextFileWriter, runDatabaseBackup, runDatabaseRestore } from "./backup-lib.js";
@@ -596,6 +596,38 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
           FROM public.restore_stream_test
         `);
         expect(rows).toEqual([{ payload: "hello" }]);
+      } finally {
+        await restoreSql.end();
+      }
+    },
+    20_000,
+  );
+
+  it(
+    "restores a legacy gzipped sql archive",
+    async () => {
+      const restoreConnectionString = await createTempDatabase();
+      const restoreSql = postgres(restoreConnectionString, { max: 1, onnotice: () => {} });
+      const backupDir = createTempDir("paperclip-db-restore-gzip-");
+      const backupFile = path.join(backupDir, "manual.sql.gz");
+      const sql = [
+        "-- Paperclip database backup",
+        "BEGIN;",
+        "-- paperclip statement breakpoint 69f6f3f1-42fd-46a6-bf17-d1d85f8f3900",
+        "CREATE TABLE public.restore_gzip_test (id integer primary key, payload text not null);",
+        "-- paperclip statement breakpoint 69f6f3f1-42fd-46a6-bf17-d1d85f8f3900",
+        "INSERT INTO public.restore_gzip_test (id, payload) VALUES (1, 'gzip-legacy');",
+        "-- paperclip statement breakpoint 69f6f3f1-42fd-46a6-bf17-d1d85f8f3900",
+        "COMMIT;",
+        "-- paperclip statement breakpoint 69f6f3f1-42fd-46a6-bf17-d1d85f8f3900",
+        "",
+      ].join("\n");
+      try {
+        await fs.promises.writeFile(backupFile, gzipSync(sql));
+        expect(gunzipSync(fs.readFileSync(backupFile)).toString("utf8")).toBe(sql);
+        await runDatabaseRestore({ connectionString: restoreConnectionString, backupFile });
+        const rows = await restoreSql.unsafe<{ payload: string }[]>(`SELECT payload FROM public.restore_gzip_test`);
+        expect(rows).toEqual([{ payload: "gzip-legacy" }]);
       } finally {
         await restoreSql.end();
       }

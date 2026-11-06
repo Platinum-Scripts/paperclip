@@ -593,6 +593,13 @@ choices, item verdicts, suggested tasks, tool reviews, runtime questions, and ph
 the bottom navigation. The normal message composer remains usable below the
 pending card.
 
+Plan reviews leave the composer and pending count when a newer saved plan
+revision is known. Document activity refreshes the interaction list, and a
+superseded or stale-target response refreshes it immediately. The UI keeps a
+newer review visible if its document query still has an older revision. These
+display rules do not resolve requests or change the server's approval checks.
+Recovery retry uses the same plan freshness check as the composer.
+
 Use **Chat & Comments → Task Chat Unanswered Questions → Test Drive** to
 try a regular task question: dismiss it, reload, reopen its compact feed entry,
 and submit the preserved draft. The composer has no question pending badge.
@@ -2046,6 +2053,14 @@ Boot validates the driver config through the plugin, marks the row
 unmarked row for the same plugin and driver. While the plugin is down, the row is
 archived; it comes back when the worker is ready. Removing an entry never archives
 its row. Plugin entries do not change the instance default.
+
+Under `enableManagedSandboxOnly`, boot fills the instance default with the
+managed sandbox only when the default is unset, names the local environment, or
+names a deleted one. The fill locks the default row and rechecks it, so a
+concurrent boot or admin write is never overwritten. A filled default is an
+ordinary set value: nothing reverts it when the mode is later turned off, and an
+admin can change it in instance settings.
+
 
 ### Experimental native remote workspace storage
 

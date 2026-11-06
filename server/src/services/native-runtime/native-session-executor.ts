@@ -7093,6 +7093,17 @@ function releasedWarmScope(input: Parameters<typeof executePaperclipNativeSessio
     accountIdentity: input.managedAiAccountIdentity ?? null, credentialIdentity: input.managedAiCredentialIdentity ?? null });
 }
 
+function requireReleasedWarmScope(input: Parameters<typeof executePaperclipNativeSession>[0],
+  proof: ReleasedWarmRunner | undefined, identity: unknown): DurableRecoveryIdentity {
+  const target = input.runnerExecutionTarget;
+  if (!proof || target?.kind !== "remote" || target.transport !== "sandbox" || !target.runnerTask
+    || proof.taskId !== target.sandboxLeaseAcquisition?.providerLeaseId
+    || proof.scopeDigest !== releasedWarmScope(input) || canonicalJson(proof.source) !== canonicalJson(identity)) {
+    throw new Error("native_session_released_owner_scope_mismatch");
+  }
+  return proof.source;
+}
+
 function readWarmNativeEnvelope(execution: NativeExecutionInput): Record<string, unknown> | null {
   const path = nativeSessionCheckpointPath(execution);
   if (!existsSync(path)) return null;
@@ -9067,6 +9078,9 @@ async function executePaperclipNativeSessionWithinScope(
   }
   let retainedTransition: VerifiedWarmTransitionBinding | undefined;
   let remoteWarmRecovery: RemoteWarmSessionRecovery | undefined;
+  const cachedReleasedOwner = warmNativeSessions.get(nativeSessionScopeKey(input.execution));
+  if (cachedReleasedOwner?.released) requireReleasedWarmScope(input, releasedWarmRunner(readWarmNativeEnvelope(input.execution)),
+    readRunnerdDurableIdentity(scopedRunnerdStateRoot(input.execution)));
   if (input.useRunnerd && !input.restartRecovery && !input.backend &&
       input.runnerExecutionTarget?.kind === "remote" &&
       input.execution.session.lifecyclePolicy.mode === "warm" &&
@@ -9103,11 +9117,7 @@ async function executePaperclipNativeSessionWithinScope(
         loadCheckpoint: previous => {
           const proof = releasedWarmRunner(readWarmNativeEnvelope(previous));
           if (proof) {
-            if (taskTarget.transport !== "sandbox" || !taskTarget.runnerTask || proof.taskId !== taskTarget.sandboxLeaseAcquisition?.providerLeaseId
-              || proof.scopeDigest !== releasedWarmScope(input) || canonicalJson(proof.source) !== canonicalJson(identity)) {
-              throw new Error("native_session_released_owner_scope_mismatch");
-            }
-            releasedSource = proof.source;
+            releasedSource = requireReleasedWarmScope(input, proof, identity);
           }
           return loadWarmNativeCheckpoint(previous, nativeSessionConfigDigest(previous, "remote"), "remote");
         },
@@ -10024,6 +10034,8 @@ async function executePaperclipNativeSessionWithinScope(
   if (warmSessionId !== null && warmConfigDigest !== null && !input.restartRecovery) {
     const entry = warmNativeSessions.get(warmSessionId);
     if (entry) {
+      if (entry.released) requireReleasedWarmScope(input, releasedWarmRunner(readWarmNativeEnvelope(input.execution)),
+        readRunnerdDurableIdentity(scopedRunnerdStateRoot(input.execution)));
       if (input.execution.provider.kind === "codex" ||
           (input.execution.provider.kind === "acpx" && input.execution.provider.agent === "claude")) {
         executionContext = claimedStartupContext ?? new NativeExecutionContext(input.execution,
@@ -11482,7 +11494,27 @@ async function executePaperclipNativeSessionWithinScope(
                 input.execution.provider.kind === "acpx" ? input.execution.provider.agent : undefined, false));
             let released: boolean | undefined;
             for (;;) {
-              try { released = await entry.session.release?.(); break; }
+              let gateTimer: ReturnType<typeof setTimeout> | undefined;
+              try {
+                const gate = new Promise<never>((_resolve, reject) => {
+                  const check = () => {
+                    if (!current() || Date.now() >= deadline || entry.closeOnReleaseReason
+                      || nativeSessionStartups.get(input.execution.binding.runId)?.stopRequested) {
+                      reject(new Error("native_session_release_reconciliation_stopped"));
+                    } else gateTimer = setTimeout(check, Math.min(25, deadline - Date.now()));
+                  };
+                  check();
+                });
+                // Observe late replies, but only this reservation may publish their result.
+                released = await Promise.race([Promise.resolve().then(() => {
+                  if (!current() || Date.now() >= deadline || entry.closeOnReleaseReason
+                    || nativeSessionStartups.get(input.execution.binding.runId)?.stopRequested) {
+                    throw new Error("native_session_release_reconciliation_stopped");
+                  }
+                  return entry.session.release?.();
+                }), gate]);
+                break;
+              }
               catch {
                 if (!current()) return;
                 if (Date.now() >= deadline || entry.closeOnReleaseReason
@@ -11494,6 +11526,7 @@ async function executePaperclipNativeSessionWithinScope(
                 }
                 await new Promise(resolve => setTimeout(resolve, 250));
               }
+              finally { clearTimeout(gateTimer); }
             }
             if (!current()) return;
             if (nativeSessionStartups.get(input.execution.binding.runId)?.stopRequested) entry.closeOnReleaseReason = "warm native session cancelled";

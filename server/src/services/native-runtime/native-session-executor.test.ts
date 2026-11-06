@@ -15188,12 +15188,12 @@ describe("runnerd provider runtime wiring", () => {
     } finally {owner.mockRestore();await rm(home,{recursive:true,force:true});}
   });
 
-  it.each((["codex", "claude"] as const).flatMap(provider => [[false, false, false], [true, false, false], [false, true, false], ...(provider === "codex" ? [[false, false, true]] : [])].map(([unknown, shutdown, journalFailure]) => [provider, unknown, shutdown, journalFailure] as const)))(
-    "releases settled %s only under its current owner and detaches its cache locally (unknown=%s, shutdown=%s, journalFailure=%s)", async (provider, unknown, shutdown, journalFailure) => {
+  it.each((["codex", "claude"] as const).flatMap(provider => [[false, false, false, false], [true, false, false, false], [false, true, false, false], ...(provider === "codex" ? [[false, false, true, false], [false, false, false, true]] : [])].map(([unknown, shutdown, journalFailure, deadline]) => [provider, unknown, shutdown, journalFailure, deadline] as const)))(
+    "releases settled %s only under its current owner and detaches its cache locally (unknown=%s, shutdown=%s, journalFailure=%s, deadline=%s)", async (provider, unknown, shutdown, journalFailure, deadline) => {
       const previousHome = process.env.PAPERCLIP_HOME;
       process.env.PAPERCLIP_HOME = isolatedStateDirectory;
       const current = scopedNativeExecution(`released-${provider}-${unknown}`);
-      current.session.lifecyclePolicy = { mode: "warm", idleTimeoutMs: 250 };
+      current.session.lifecyclePolicy = { mode: "warm", idleTimeoutMs: unknown ? 750 : 250 };
       if (provider === "claude") current.provider = { kind: "acpx", agent: "claude", model: "fixture", permissionMode: "deny-all" } as never;
       const source = { runnerInstanceId: "released-runner", environmentLeaseId: "released-lease", runId: current.binding.runId,
         normalizedSessionId: current.session.normalizedSessionId!, turnId: "settled-turn", itemId: "settled-item" };
@@ -15221,7 +15221,7 @@ describe("runnerd provider runtime wiring", () => {
       });
       let allowPhysicalStop!: () => void;
       const physicalStop = new Promise<void>(resolve => { allowPhysicalStop = resolve; });
-      const close = vi.fn(async () => { if (shutdown) await physicalStop; }), detachControllerForRestart = vi.fn(async () => {});
+      const close = vi.fn(async () => { if (shutdown || deadline) await physicalStop; }), detachControllerForRestart = vi.fn(async () => {});
       const session = { release, close, detachControllerForRestart };
       const validated = validatePrpStructuredRunResult({ schema: "paperclip.run_result.v1", reportedWorkDisposition: "done",
         summary: "Completed", completionClaim: { contractRevision: current.completionContract.contract.revision,
@@ -15250,12 +15250,20 @@ describe("runnerd provider runtime wiring", () => {
           runnerInstanceId: source.runnerInstanceId, useRunnerd: true, runnerIngressAuthorized: true,
           runnerExecutionTarget: { ...target, runnerTask: nextTask } })).rejects.toThrow("native_session_supervisor_busy");
         expect(nextTask).not.toHaveBeenCalled();
-        if (shutdown) {
-          expect(await closeIdleWarmNativeSessionsForRestart()).toMatchObject({ busy: 1 });
-          allowRelease();
+        if (shutdown || deadline) {
+          if (shutdown) expect(await closeIdleWarmNativeSessionsForRestart()).toMatchObject({ busy: 1 });
           await vi.waitFor(() => expect(close).toHaveBeenCalledOnce());
           expect(readNativeSessionIdleWork()).toBe("present");
           expect(detachControllerForRestart).not.toHaveBeenCalled();
+          // A late host receipt cannot publish a released owner during retirement.
+          allowRelease();
+          await receipt;
+          await Promise.resolve();
+          expect(readNativeSessionIdleWork()).toBe("present");
+          await expect(executePaperclipNativeSession({ db: leaseDb(next), execution: next,
+            runnerInstanceId: source.runnerInstanceId, useRunnerd: true, runnerIngressAuthorized: true,
+            runnerExecutionTarget: { ...target, runnerTask: nextTask } })).rejects.toThrow("native_session_supervisor_busy");
+          expect(nextTask).not.toHaveBeenCalled();
           allowPhysicalStop();
           await expect(execute).resolves.toMatchObject({ sessionId: source.normalizedSessionId });
           expect(readNativeSessionIdleWork()).toBe("none");
@@ -15287,6 +15295,20 @@ describe("runnerd provider runtime wiring", () => {
         const envelope = JSON.parse(await readFile(path, "utf8"));
         expect(envelope.releasedRunner).toMatchObject({ source, taskId: "retained-task", scopeDigest: expect.any(String) });
         expect(JSON.stringify(envelope)).not.toContain("synthetic-fixture");
+        if (!unknown) {
+          const calls = owners.mock.calls.length;
+          for (const changed of [{ remoteCwd: "different-workspace" }, { runnerTaskProjectIds: ["different-project"] }]) {
+            await expect(executePaperclipNativeSession({ db: leaseDb(next), execution: next,
+              runnerInstanceId: source.runnerInstanceId, useRunnerd: true, runnerIngressAuthorized: true,
+              managedAiCredentialHome: home, managedAiCredentialIdentity: "selected-revision", managedAiAccountIdentity: "selected-account",
+              runnerExecutionTarget: { ...target, ...changed, runnerTask: nextTask },
+              runnerEnvironment: provider === "claude" ? { ANTHROPIC_API_KEY: "synthetic-fixture" } : {} })).rejects.toThrow("released_owner_scope_mismatch");
+          }
+          expect(owners).toHaveBeenCalledTimes(calls);
+          expect(nextTask).not.toHaveBeenCalled();
+          expect(state.execute).toHaveBeenCalledTimes(1);
+          expect(JSON.parse(await readFile(path, "utf8")).releasedRunner).toEqual(envelope.releasedRunner);
+        }
         await vi.waitFor(() => expect(detachControllerForRestart).toHaveBeenCalledOnce());
         expect(close).not.toHaveBeenCalled();
         expect(task.mock.calls.map(([operation]) => (operation as { kind: string }).kind)).toEqual(["describe"]);

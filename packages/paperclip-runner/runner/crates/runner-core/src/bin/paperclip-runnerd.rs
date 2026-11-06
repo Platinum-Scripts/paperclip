@@ -1,3 +1,4 @@
+// Image build cache probe: a comment-only Runner source change.
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};

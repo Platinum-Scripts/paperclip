@@ -1,14 +1,19 @@
 import { createHash, randomBytes } from "node:crypto";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { expect, it, vi } from "vitest";
 import type { DurablePrpControlPlane, RunnerProcessHandle, PrpWireConnection, TransportCloseReason } from "../control-plane/durable-prp-control-plane.js";
 import { createCapabilityRunnerdCodexTransport, readRunnerdArtifactBinding } from "./runnerd-codex-transport.js";
 import { defaultCapabilityRunnerdBinary, fakeCodex, fakeCodexArgs } from "../../test/support/runnerd-transport.js";
 import { createPrivateHostControlFixture } from "../../test/support/private-host-control.js";
+import { CodexAppServerDriver } from "../drivers/codex/codex-app-server-driver.js";
+import { createCodexTaskEnvelope } from "../contracts/codex.js";
+import type { HarnessSession, PersistedHarnessSession } from "../contracts/harness-driver.js";
+import { QUALIFIED_ACPX_PROFILES } from "../drivers/acpx/qualified-profiles.js";
+import { createRunnerProviderLaunch, runnerLaunchRequirementsDigest, type RunnerProviderLaunchRequirements } from "./runner-provider-launch.js";
 
 const digest = (value: string) => createHash("sha256").update(value).digest("hex");
 const read = async (path: string) => JSON.parse(await readFile(path, "utf8"));
@@ -70,9 +75,17 @@ async function nativeWire(port: number, path: string): Promise<PrpWireConnection
   });
 }
 
-it.skipIf(process.platform === "win32").each(["cached", "lost claim reply", "cache adoption", "unavailable", "claim cancellation", "expired ticket"] as const)(
+it.skipIf(process.platform === "win32").each(["cached", "lost claim reply", "cache adoption", "acpx cache adoption", "unavailable", "claim cancellation", "expired ticket"] as const)(
   "releases and resumes the native Codex source before attachment (%s)", async mode => {
     const root = await mkdtemp(join(tmpdir(), "runner-release-resume-"));
+    const acpx = mode === "acpx cache adoption";
+    const sidecar = join(root, "sidecar"), sidecarScript = join(root, "sidecar-entry");
+    if (acpx) {
+      const quote = (value: string) => `'${value.replaceAll("'", "'\"'\"'")}'`;
+      const fake = resolve(import.meta.dirname, "../../runner/target/debug/fake-acpx-sidecar");
+      await writeFile(sidecarScript, "qualified fixture entry");
+      await writeFile(sidecar, `#!/bin/sh\nexec ${quote(fake)} --mode source-reconcile --profile-digest ${quote(QUALIFIED_ACPX_PROFILES.claude.commandDigest)} --journal ${quote(join(root, "calls"))} --source-fault ${quote(join(root, "fault"))}\n`, { mode: 0o700 });
+    }
     const listener = createServer();
     await new Promise<void>(resolve => listener.listen(0, "127.0.0.1", resolve));
     const address = listener.address();
@@ -148,11 +161,17 @@ it.skipIf(process.platform === "win32").each(["cached", "lost claim reply", "cac
         return "resumed";
       }),
     };
-    const launch = vi.fn((spec: Parameters<typeof fixture.launch>[0]) => { handle = fixture.launch(spec); return handle; });
+    const acpxArguments = acpx ? ["--acpx-launch-authority-digest", `sha256:${digest("fixture authority")}`,
+      "--acpx-sidecar-command", sidecar, "--acpx-sidecar-command-sha256", `sha256:${digest(await readFile(sidecar, "utf8"))}`,
+      "--acpx-sidecar-script", sidecarScript, "--acpx-sidecar-script-sha256", `sha256:${digest("qualified fixture entry")}`] : [];
+    const launch = vi.fn((spec: Parameters<typeof fixture.launch>[0]) => { handle = fixture.launch({ ...spec, args: [...spec.args, ...acpxArguments] }); return handle; });
     const options = { runnerBinary: binary, runnerArtifact: readRunnerdArtifactBinding(binary), stateDirectory: root,
       codexCommand: fakeCodex, codexArgs: fakeCodexArgs(root), prpIdentity: identity,
       get authorityRunId() { return claimantRunId; }, lifecyclePolicy: { mode: "warm" as const, idleTimeoutMs: 60_000 },
-      runnerProcessLauncher: launch, controlPlaneRegistration: registration, releaseResume: pair };
+      runnerProcessLauncher: launch, controlPlaneRegistration: registration, releaseResume: pair,
+      ...(acpx ? { provider: "acpx" as const, acpxAgent: "claude" as const, acpxRuntimeDirectory: join(root, "acpx"),
+        prepareLaunch: async (input: RunnerProviderLaunchRequirements) => ({ configurationId: `fixture-${input.identity.runId}`, requirementsDigest: runnerLaunchRequirementsDigest(input),
+          provider: createRunnerProviderLaunch(input, { options: {}, root, cwd: root, codexHome: root, codexCommand: "", providerNodeCommand: sidecar, opencodeProxyPath: "", acpxSidecarPath: sidecarScript }) }) } : {}) };
     const intervals = new Set<unknown>(), originalInterval = globalThis.setInterval, originalClear = globalThis.clearInterval;
     const armInterval = vi.spyOn(globalThis, "setInterval").mockImplementation((...args: Parameters<typeof setInterval>) => {
       const timer = originalInterval(...args);
@@ -163,13 +182,19 @@ it.skipIf(process.platform === "win32").each(["cached", "lost claim reply", "cac
       intervals.delete(args[0]); originalClear(...args);
     });
     let bundle = createCapabilityRunnerdCodexTransport(options);
+    let recoveredSession: HarnessSession | undefined;
     const complete = async () => {
+      if (recoveredSession) {
+        await recoveredSession.startTurn({ message: { role: "user", text: "Complete the fixture follow-up" } });
+        for await (const event of recoveredSession.events()) if (event.eventType === "turn.completed") return;
+        throw new Error("Fixture follow-up terminal unavailable");
+      }
       const terminal = (async () => { for await (const event of bundle.transport.notifications()) if (event.method === "turn/completed") return; })();
       await bundle.transport.request("turn/start", { input: [{ type: "text", text: "Complete the fixture turn" }] });
       await terminal;
     };
     try {
-      const opened = await bundle.transport.request("thread/start", { cwd: root, dynamicTools: [] });
+      const opened = await bundle.transport.request("thread/start", { cwd: root, dynamicTools: [], ...(acpx ? { model: "explicit-source-model" } : {}) });
       const threadId = String((opened.thread as { id: string }).id);
       await complete();
       if (mode === "cached") {
@@ -188,13 +213,21 @@ it.skipIf(process.platform === "win32").each(["cached", "lost claim reply", "cac
         finally { unsettled.mockRestore(); }
         expect(pair.release).not.toHaveBeenCalled();
       }
-      await vi.waitFor(async () => expect(await bundle.transport.release!()).toBe(true), { timeout: 5_000 });
+      await vi.waitFor(async () => expect(await bundle.transport.release!()).toEqual(identity), { timeout: 5_000 });
+      if (mode === "cached") {
+        const source = await bundle.transport.release!();
+        expect(source).toEqual(identity);
+        if (source !== false) source.runId = "changed-return-value";
+        expect(await bundle.transport.release!()).toEqual(identity);
+        expect(pair.release).toHaveBeenCalledOnce();
+      }
       await vi.waitFor(() => expect(authority?.activeRunnerConnectionCount()).toBe(0));
       expect(intervals.size).toBe(0);
       expect(launch).toHaveBeenCalledOnce();
       await expect(bundle.transport.request("turn/start", { input: [] })).rejects.toThrow("release_resume_pending");
+      await expect(bundle.transport.request("thread/resume", { threadId })).rejects.toThrow("release_resume_pending");
       claimantRunId = "claimant-run";
-      if (mode === "cache adoption") {
+      if (mode === "cache adoption" || mode === "acpx cache adoption") {
         await bundle.transport.detachControllerForRestart!();
         bundle = createCapabilityRunnerdCodexTransport({ ...options, get authorityRunId() { return claimantRunId; },
           releaseResume: { ...pair, releasedSource: identity },
@@ -203,10 +236,27 @@ it.skipIf(process.platform === "win32").each(["cached", "lost claim reply", "cac
             signal: () => { handle!.child.kill("SIGKILL"); return true; } },
           resumeProviderSession: { driverSessionId: threadId, providerSessionId: threadId },
         });
-        await bundle.transport.request("thread/read", { threadId });
+        const request = vi.spyOn(bundle.transport, "request");
+        const driver = new CodexAppServerDriver({ conversationMode: "direct",
+          taskEnvelope: createCodexTaskEnvelope({ objective: "Complete the fixture turn", contractRevision: "fixture", criteria: [] }),
+          transportFactory: () => bundle.transport, workingDirectoryAuthority: "remote_runner", environment: { PAPERCLIP_WORKSPACE_CWD: root },
+          ...(acpx ? { capabilities: { goals: false, threadLineage: false }, driverIdentity: { kind: "acpx_runtime", displayName: "Claude via ACPX", version: "fixture" } } : {}) });
+        const original = opened.thread as { sessionId: string; providerIdentity?: PersistedHarnessSession["providerIdentity"] };
+        const recovered = await driver.recoverSession({ driverKind: acpx ? "acpx_runtime" : "codex_app_server",
+          driverSessionId: threadId, providerSessionId: original.sessionId, providerIdentity: original.providerIdentity,
+          runId: identity.runId, normalizedSessionId: identity.normalizedSessionId });
+        expect(recovered.recovered, recovered.reason).toBe(true);
+        recoveredSession = recovered.session;
+        expect(request.mock.calls.map(([method]) => method)).toEqual(expect.arrayContaining(["thread/read", "thread/turns/list", "thread/resume"]));
+        expect((await recoveredSession!.snapshot()).driverSessionId).toBe(threadId);
+        await expect(bundle.transport.request("thread/resume", { threadId: "foreign-thread" })).rejects.toThrow("history_identity_mismatch");
+        await expect(bundle.transport.request("turn/start", { input: [] })).rejects.toThrow("release_resume_pending");
+        await expect(bundle.transport.request("thread/goal/set", { threadId, objective: "Must stay fenced" })).rejects.toThrow("release_resume_pending");
       }
       if (mode === "unavailable") await fixture.close();
-      const attaching = bundle.transport.attachRun!({ runId: claimantRunId, turnId: "next-turn", itemId: "next-item" });
+      const attaching = Promise.resolve(recoveredSession
+        ? recoveredSession.attachRun!({ runId: claimantRunId })
+        : bundle.transport.attachRun!({ runId: claimantRunId, turnId: "next-turn", itemId: "next-item" }));
       void attaching.catch(() => undefined);
       if (mode === "claim cancellation") {
         await vi.waitFor(() => expect(claimAccepted).toBe(true));
@@ -235,7 +285,8 @@ it.skipIf(process.platform === "win32").each(["cached", "lost claim reply", "cac
       expect((await read(runnerFile)).runId).toBe(claimantRunId);
       expect(launch).toHaveBeenCalledOnce();
       await complete();
-      await vi.waitFor(async () => expect(await bundle.transport.release!()).toBe(true), { timeout: 5_000 });
+      const nextSource = structuredClone(authority!.store.state.identity);
+      await vi.waitFor(async () => expect(await bundle.transport.release!()).toEqual(nextSource), { timeout: 5_000 });
       expect(intervals.size).toBe(0);
       await bundle.transport.close();
       expect(closeCheckpoint).toBe(1);

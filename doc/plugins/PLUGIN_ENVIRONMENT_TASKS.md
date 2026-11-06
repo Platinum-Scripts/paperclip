@@ -141,7 +141,11 @@ cleanup. Transparent cold fallback remains a separate qualification requirement.
 A normal Core cache timeout detaches only Core's quiet local owner. The host
 keeps its retained resources under its own retention policy. Core's existing
 completed-session record stores only the confirmed source, physical task and a
-digest of the selected account, credential revision and workspace scope. Later
+digest of the selected account, credential revision and workspace scope. The
+transport returns the exact source after the host's release receipt; Core does
+not infer it from a local checkpoint marker, which may still name an older run.
+An invalid source receipt or failed proof write keeps cleanup under the same
+owner until physical retirement finishes. Later
 cache adoption validates that Core-authored proof before claiming or
 reconnecting. A stale or missing proof never licenses a claim. A changed
 selection remains blocked until guarded retirement/recovery; it does not imply

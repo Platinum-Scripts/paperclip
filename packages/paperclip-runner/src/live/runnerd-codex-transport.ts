@@ -3990,7 +3990,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   ): Promise<Record<string, unknown>> {
     if (this.#closed) throw new Error("PRP Codex transport is closed");
     this.#throwIfFailed();
-    if (this.#releaseEpisode && !(this.#releaseEpisode.claimed && ["initialize", "collaborationMode/list", "thread/read", "thread/turns/list", "thread/items/list"].includes(method))) {
+    if (this.#releaseEpisode && !(this.#releaseEpisode.claimed && ["initialize", "collaborationMode/list", "thread/read", "thread/resume", "thread/turns/list", "thread/items/list"].includes(method))) {
       throw new Error("native_runner_release_resume_pending");
     }
     const expectedThread = this.#threadId || this.options.resumeProviderSession?.driverSessionId;
@@ -4386,7 +4386,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     this.#adoptedRunnerMonitor = null;
   }
 
-  async #releaseSettledRunner(): Promise<boolean> {
+  async #releaseSettledRunner(): Promise<DurableRecoveryIdentity | false> {
     const pair = this.options.releaseResume;
     const core = this.#core;
     if (!pair || this.options.lifecyclePolicy?.mode !== "warm") return false;
@@ -4421,10 +4421,10 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       this.#assertStartupOpen();
       episode.confirmed = true;
     }
-    return true;
+    return structuredClone(episode.source);
   }
 
-  release(): Promise<boolean> {
+  release(): Promise<DurableRecoveryIdentity | false> {
     if (this.#attachmentOperation) return Promise.reject(new Error("native_runner_run_attachment_in_progress"));
     const operation = this.#releaseSettledRunner();
     const pending = operation.then(() => {});

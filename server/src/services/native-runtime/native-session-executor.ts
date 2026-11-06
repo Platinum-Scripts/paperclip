@@ -11536,21 +11536,10 @@ async function executePaperclipNativeSessionWithinScope(
               forgetWarmNativeSession(scope, entry);
               return;
             }
-            const identity = readRunnerdDurableIdentity(scopedRunnerdStateRoot(input.execution));
-            if (!identity || identity.runId !== input.execution.binding.runId
-              || identity.normalizedSessionId !== nativeSessionKey(input.execution) || !identity.turnId || !identity.itemId || !entry.pluginTaskId) {
-              throw new Error("native_session_released_source_mismatch");
-            }
-            const operation = environmentTaskOperationSchema.parse({ kind: "release", identity: {
-              runnerInstanceId: identity.runnerInstanceId, environmentLeaseId: identity.environmentLeaseId,
-              runId: identity.runId, normalizedSessionId: identity.normalizedSessionId, turnId: identity.turnId, itemId: identity.itemId,
-            } });
-            if (operation.kind !== "release") throw new Error("native_session_released_source_mismatch");
-            const source = operation.identity;
             const deadline = Date.now() + Math.min(lifecyclePolicy.idleTimeoutMs,
               coldAdmissionTimeoutMs(input.execution.provider.kind,
                 input.execution.provider.kind === "acpx" ? input.execution.provider.agent : undefined, false));
-            let released: boolean | undefined;
+            let released: DurableRecoveryIdentity | false | undefined;
             for (;;) {
               let gateTimer: ReturnType<typeof setTimeout> | undefined;
               try {
@@ -11593,12 +11582,23 @@ async function executePaperclipNativeSessionWithinScope(
               forgetWarmNativeSession(scope, entry);
               return;
             }
-            if (released) {
+            if (released !== false && released !== undefined) {
               try {
+                const operation = environmentTaskOperationSchema.parse({ kind: "release", identity: released });
+                const target = input.runnerExecutionTarget;
+                if (operation.kind !== "release" || operation.identity.runId !== input.execution.binding.runId
+                  || operation.identity.normalizedSessionId !== nativeSessionKey(input.execution)
+                  || operation.identity.runnerInstanceId !== effectiveRunnerInstanceId
+                  || target?.kind !== "remote" || operation.identity.environmentLeaseId !== (durableRunnerBinding?.environmentLeaseId ?? target.leaseId)
+                  || target.transport !== "sandbox" || !entry.pluginTaskId
+                  || entry.pluginTaskId !== target.sandboxLeaseAcquisition?.providerLeaseId) {
+                  throw new Error("native_session_released_source_mismatch");
+                }
+                const source = operation.identity;
                 updateReleasedWarmRunner(input.execution, source, entry.pluginTaskId,
                   { source, taskId: entry.pluginTaskId, scopeDigest: releasedWarmScope(input) });
               } catch {
-                entry.closeOnReleaseReason = "released Runner source proof could not be saved";
+                entry.closeOnReleaseReason = "released Runner source proof could not be verified or saved";
                 await closeWarmNativeSession(entry, entry.closeOnReleaseReason);
                 forgetWarmNativeSession(scope, entry);
                 return;

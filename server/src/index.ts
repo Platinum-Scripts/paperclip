@@ -82,6 +82,7 @@ import { setSentryRunLinkResolver } from "./sentry-links.js";
 import { createSentryRunLinkResolver } from "./services/sentry-run-links.js";
 import { waitForPendingRunFailureReports } from "./services/run-failure-report.js";
 import { verifyStoppedNativeSessionForReplacement } from "./services/native-runtime/native-session-executor.js";
+import { logNativeCleanupQuarantines } from "./services/native-runtime/native-cleanup-quarantine-log.js";
 import { embeddedPostgresOwnerPort } from "./embedded-postgres-owner.js";
 import { deliverExecutionStatuses } from "./services/execution-status-delivery.js";
 import { deliverReconciledExecutions, settleUnrecoverableExecutions } from "./services/execution-recovery-resolution.js";
@@ -1351,6 +1352,9 @@ async function startServerWithDatabaseTeardown(
   if (skillVersionRetentionWorker) trackHeartbeatSchedulerWork(skillVersionRetentionWorker.ready);
   const workspaceRecoveryWork = registerWorkspaceRecoveryWork(db, deliveryWork, workspaceRecoveryRuntime,
     accountingHeartbeat.resumeRemoteStopComments, () => !heartbeatSchedulerStopped);
+  // Each native cleanup quarantine is logged with its cause when created.
+  const unsubscribeNativeCleanupQuarantineLog = logNativeCleanupQuarantines(logger);
+  server.on("close", unsubscribeNativeCleanupQuarantineLog);
   const localLoginCleanup = localAiLoginService(db);
   const localLoginCleanupWork = registerExecutionControlWork(deliveryWork, [
     { queue: DELIVERY_QUEUES.localLoginCleanup, run: localLoginCleanup.reapExpired, next: localLoginCleanup.nextCleanupAt },

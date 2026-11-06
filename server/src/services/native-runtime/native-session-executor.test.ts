@@ -15260,7 +15260,7 @@ describe("runnerd provider runtime wiring", () => {
     } finally {owner.mockRestore();await rm(home,{recursive:true,force:true});}
   });
 
-  it.each((["codex", "claude"] as const).flatMap(provider => [[false, false, false, false], [true, false, false, false], [false, true, false, false], ...(provider === "codex" ? [[false, false, true, false], [false, false, false, true]] : [])].map(([unknown, shutdown, journalFailure, deadline]) => [provider, unknown, shutdown, journalFailure, deadline] as const)))(
+  it.each((["codex", "claude"] as const).flatMap(provider => [[false, false, false, false], [true, false, false, false], [false, true, false, false], [false, false, true, false], ...(provider === "codex" ? [[false, false, false, true]] : [])].map(([unknown, shutdown, journalFailure, deadline]) => [provider, unknown, shutdown, journalFailure, deadline] as const)))(
     "releases settled %s only under its current owner and detaches its cache locally (unknown=%s, shutdown=%s, journalFailure=%s, deadline=%s)", async (provider, unknown, shutdown, journalFailure, deadline) => {
       await closeIdleWarmNativeSessionsForRestart();
       expect(readNativeSessionIdleWork()).toBe("none");
@@ -15295,7 +15295,7 @@ describe("runnerd provider runtime wiring", () => {
       });
       let allowPhysicalStop!: () => void;
       const physicalStop = new Promise<void>(resolve => { allowPhysicalStop = resolve; });
-      const close = vi.fn(async () => { if (shutdown || deadline) await physicalStop; }), detachControllerForRestart = vi.fn(async () => {});
+      const close = vi.fn(async () => { if (shutdown || deadline || journalFailure) await physicalStop; }), detachControllerForRestart = vi.fn(async () => {});
       const session = { release, close, detachControllerForRestart };
       const validated = validatePrpStructuredRunResult({ schema: "paperclip.run_result.v1", reportedWorkDisposition: "done",
         summary: "Completed", completionClaim: { contractRevision: current.completionContract.contract.revision,
@@ -15350,13 +15350,25 @@ describe("runnerd provider runtime wiring", () => {
           const path = join(directory, (await readdir(directory))[0]!);
           await rename(path, `${path}.saved`);
           await mkdir(path);
+          let finished = false;
+          void execute.finally(() => { finished = true; }).catch(() => undefined);
           allowRelease();
-          await expect(execute).resolves.toMatchObject({ sessionId: source.normalizedSessionId });
+          await new Promise(resolve => setImmediate(resolve));
+          expect(finished).toBe(false);
+          await expect(executePaperclipNativeSession({ db: leaseDb(next), execution: next,
+            runnerInstanceId: source.runnerInstanceId, useRunnerd: true, runnerIngressAuthorized: true,
+            managedAiCredentialHome: home, managedAiCredentialIdentity: "selected-revision", managedAiAccountIdentity: "selected-account",
+            runnerExecutionTarget: { ...target, remoteCwd: "different-workspace", runnerTask: nextTask } })).rejects.toThrow("native_session_supervisor_busy");
+          expect(nextTask).not.toHaveBeenCalled();
+          await vi.waitFor(() => expect(close).toHaveBeenCalledOnce());
           expect(readNativeSessionIdleWork()).toBe("present");
+          expect(finished).toBe(false);
           await rm(path, { recursive: true });
           await rename(`${path}.saved`, path);
           expect(JSON.parse(await readFile(path, "utf8")).releasedRunner).toBeUndefined();
-          await vi.waitFor(() => expect(close).toHaveBeenCalledOnce());
+          allowPhysicalStop();
+          await expect(execute).resolves.toMatchObject({ sessionId: source.normalizedSessionId });
+          expect(readNativeSessionIdleWork()).toBe("none");
           expect(detachControllerForRestart).not.toHaveBeenCalled();
           return;
         }

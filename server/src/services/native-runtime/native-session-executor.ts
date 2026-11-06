@@ -11565,8 +11565,15 @@ async function executePaperclipNativeSessionWithinScope(
               return;
             }
             if (released) {
-              updateReleasedWarmRunner(input.execution, source, entry.pluginTaskId,
-                { source, taskId: entry.pluginTaskId, scopeDigest: releasedWarmScope(input) });
+              try {
+                updateReleasedWarmRunner(input.execution, source, entry.pluginTaskId,
+                  { source, taskId: entry.pluginTaskId, scopeDigest: releasedWarmScope(input) });
+              } catch {
+                entry.closeOnReleaseReason = "released Runner source proof could not be saved";
+                await closeWarmNativeSession(entry, entry.closeOnReleaseReason);
+                forgetWarmNativeSession(scope, entry);
+                return;
+              }
               entry.released = true;
             }
           } catch {

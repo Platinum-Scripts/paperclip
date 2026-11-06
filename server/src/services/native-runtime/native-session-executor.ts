@@ -10530,7 +10530,7 @@ async function executePaperclipNativeSessionWithinScope(
               if (session && session === existingWarmSession) remoteWarmRecoveryPending = false;
               if (session && (input.managedAiCredentialHome || (input.runnerExecutionTarget?.kind === "remote"
                 && input.runnerExecutionTarget.transport === "sandbox" && input.runnerExecutionTarget.runnerTask))) {
-                const bound = runnerdBackend?.bindManagedSession(session) ?? session;
+                const bound = runnerdBackend?.bindManagedSession(session, input.managedAiCredentialHome ? undefined : { releaseResumeOnly: true }) ?? session;
                 if (input.managedAiCredentialHome) managedCredentialSession = bound;
               }
               releaseRegisteredGoalController();
@@ -13613,7 +13613,7 @@ async function prepareRemoteExternalRunner({ input, target, runner, root, identi
 }
 
 type ManagedRunnerdBackend = NativeSessionBackend & {
-  bindManagedSession(session: NativeSession): NativeSession;
+  bindManagedSession(session: NativeSession, options?: { releaseResumeOnly: true }): NativeSession;
   bindDiagnosticSession?(session: NativeSession): void;
   sessionCheckpointPersisted?(snapshot: PersistedNativeSession): void;
 };
@@ -13982,8 +13982,8 @@ async function createRunnerdBackendWithinSessionClaim(
     sessionToolAuthorityEpochs.set(sessionScopeId, authorityEpoch);
     return { ...backend, descriptor: () => backend.descriptor(), openSession: session => backend.openSession(session),
       recoverSession: (snapshot, options) => backend.recoverSession!(snapshot, options),
-      bindManagedSession: session => {
-        if (input.managedAiCredentialHome || description.releaseResumeVersion === 1) pluginTaskSessionOwners.set(session, owner);
+      bindManagedSession: (session, options) => {
+        if (!options?.releaseResumeOnly || description.releaseResumeVersion === 1) pluginTaskSessionOwners.set(session, owner);
         return session;
       } };
   }
